@@ -1,24 +1,17 @@
-"""
-Корнуэльская комната с ray tracing
-Управление:
-  [1] - включить/выключить отражение шаров
-  [2] - включить/выключить отражение кубов
-  [3] - включить/выключить прозрачность шаров
-  [4] - включить/выключить прозрачность кубов
-  [L/R/B/T/F/N] - выбор зеркальной стены
-  [SPACE] - перерендерить
-"""
-
-import tkinter as tk
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 import math
 
-# ==================== МАТЕМАТИКА ====================
 
+@dataclass
 class Vec3:
-    def __init__(self, x, y, z):
-        self.x = x
-        self.y = y
-        self.z = z
+    """3D вектор"""
+    x: float
+    y: float
+    z: float
 
     def __add__(self, other):
         return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
@@ -29,411 +22,584 @@ class Vec3:
     def __mul__(self, scalar):
         return Vec3(self.x * scalar, self.y * scalar, self.z * scalar)
 
+    def __truediv__(self, scalar):
+        return Vec3(self.x / scalar, self.y / scalar, self.z / scalar)
+
     def dot(self, other):
         return self.x * other.x + self.y * other.y + self.z * other.z
 
+    def cross(self, other):
+        return Vec3(
+            self.y * other.z - self.z * other.y,
+            self.z * other.x - self.x * other.z,
+            self.x * other.y - self.y * other.x
+        )
+
     def length(self):
-        return math.sqrt(self.x**2 + self.y**2 + self.z**2)
+        return math.sqrt(self.x ** 2 + self.y ** 2 + self.z ** 2)
 
     def normalize(self):
-        l = self.length()
-        if l > 0:
-            return Vec3(self.x/l, self.y/l, self.z/l)
+        length = self.length()
+        if length > 0:
+            return self / length
         return Vec3(0, 0, 0)
 
-    def reflect(self, normal):
-        d = 2 * self.dot(normal)
-        return Vec3(self.x - d * normal.x,
-                   self.y - d * normal.y,
-                   self.z - d * normal.z)
+    def to_array(self):
+        return np.array([self.x, self.y, self.z])
 
-# ==================== ОБЪЕКТЫ ====================
 
+@dataclass
+class Ray:
+    """Луч"""
+    origin: Vec3
+    direction: Vec3
+
+
+@dataclass
 class Material:
-    def __init__(self, color, reflective=False, transparent=False):
-        self.color = color
-        self.reflective = reflective
-        self.transparent = transparent
+    """Материал поверхности"""
+    color: Vec3
+    ambient: float = 0.1
+    diffuse: float = 0.7
+    specular: float = 0.2
+    shininess: float = 32.0
+    emissive: Vec3 = None
+    transparency: float = 0.0
+
+    def __post_init__(self):
+        if self.emissive is None:
+            self.emissive = Vec3(0, 0, 0)
+
+
+@dataclass
+class HitRecord:
+    """Информация о пересечении луча с объектом"""
+    point: Vec3
+    normal: Vec3
+    t: float
+    material: Material
+
 
 class Sphere:
-    def __init__(self, center, radius, material):
+    """Сфера"""
+
+    def __init__(self, center: Vec3, radius: float, material: Material):
         self.center = center
         self.radius = radius
         self.material = material
+        self.original_material = material
 
-    def intersect(self, ray_origin, ray_dir):
-        oc = ray_origin - self.center
-        a = ray_dir.dot(ray_dir)
-        b = 2.0 * oc.dot(ray_dir)
+    def set_transparency(self, transparent: bool):
+        """Включение/выключение прозрачности"""
+        if transparent:
+            self.material = Material(
+                color=self.original_material.color,
+                ambient=self.original_material.ambient,
+                diffuse=self.original_material.diffuse,
+                specular=self.original_material.specular,
+                shininess=self.original_material.shininess,
+                emissive=self.original_material.emissive,
+                transparency=0.6
+            )
+        else:
+            self.material = self.original_material
+
+    def intersect(self, ray: Ray) -> Optional[HitRecord]:
+        oc = ray.origin - self.center
+        a = ray.direction.dot(ray.direction)
+        b = 2.0 * oc.dot(ray.direction)
         c = oc.dot(oc) - self.radius * self.radius
-        discriminant = b*b - 4*a*c
+        discriminant = b * b - 4 * a * c
 
         if discriminant < 0:
             return None
 
         t = (-b - math.sqrt(discriminant)) / (2.0 * a)
         if t < 0.001:
-            return None
+            t = (-b + math.sqrt(discriminant)) / (2.0 * a)
+            if t < 0.001:
+                return None
 
-        point = ray_origin + ray_dir * t
+        point = Vec3(
+            ray.origin.x + t * ray.direction.x,
+            ray.origin.y + t * ray.direction.y,
+            ray.origin.z + t * ray.direction.z
+        )
         normal = (point - self.center).normalize()
-        return (t, point, normal)
 
-class Box:
-    def __init__(self, center, size, material):
+        return HitRecord(point, normal, t, self.material)
+
+
+class Cube:
+    """Куб"""
+
+    def __init__(self, center: Vec3, size: float, material: Material):
         self.center = center
         self.size = size
         self.material = material
-        self.min_p = Vec3(center.x - size.x/2, center.y - size.y/2, center.z - size.z/2)
-        self.max_p = Vec3(center.x + size.x/2, center.y + size.y/2, center.z + size.z/2)
+        self.original_material = material
+        self.min_corner = Vec3(center.x - size / 2, center.y - size / 2, center.z - size / 2)
+        self.max_corner = Vec3(center.x + size / 2, center.y + size / 2, center.z + size / 2)
 
-    def intersect(self, ray_origin, ray_dir):
-        tmin = (self.min_p.x - ray_origin.x) / ray_dir.x if abs(ray_dir.x) > 0.0001 else -1e10
-        tmax = (self.max_p.x - ray_origin.x) / ray_dir.x if abs(ray_dir.x) > 0.0001 else 1e10
+    def set_transparency(self, transparent: bool):
+        """Включение/выключение прозрачности"""
+        if transparent:
+            self.material = Material(
+                color=self.original_material.color,
+                ambient=self.original_material.ambient,
+                diffuse=self.original_material.diffuse,
+                specular=self.original_material.specular,
+                shininess=self.original_material.shininess,
+                emissive=self.original_material.emissive,
+                transparency=0.6
+            )
+        else:
+            self.material = self.original_material
+
+    def intersect(self, ray: Ray) -> Optional[HitRecord]:
+        tmin = (self.min_corner.x - ray.origin.x) / ray.direction.x if ray.direction.x != 0 else float('-inf')
+        tmax = (self.max_corner.x - ray.origin.x) / ray.direction.x if ray.direction.x != 0 else float('inf')
 
         if tmin > tmax:
             tmin, tmax = tmax, tmin
 
-        tymin = (self.min_p.y - ray_origin.y) / ray_dir.y if abs(ray_dir.y) > 0.0001 else -1e10
-        tymax = (self.max_p.y - ray_origin.y) / ray_dir.y if abs(ray_dir.y) > 0.0001 else 1e10
+        tymin = (self.min_corner.y - ray.origin.y) / ray.direction.y if ray.direction.y != 0 else float('-inf')
+        tymax = (self.max_corner.y - ray.origin.y) / ray.direction.y if ray.direction.y != 0 else float('inf')
 
         if tymin > tymax:
             tymin, tymax = tymax, tymin
 
-        if tmin > tymax or tymin > tmax:
+        if (tmin > tymax) or (tymin > tmax):
             return None
 
-        tmin = max(tmin, tymin)
-        tmax = min(tmax, tymax)
+        if tymin > tmin:
+            tmin = tymin
+        if tymax < tmax:
+            tmax = tymax
 
-        tzmin = (self.min_p.z - ray_origin.z) / ray_dir.z if abs(ray_dir.z) > 0.0001 else -1e10
-        tzmax = (self.max_p.z - ray_origin.z) / ray_dir.z if abs(ray_dir.z) > 0.0001 else 1e10
+        tzmin = (self.min_corner.z - ray.origin.z) / ray.direction.z if ray.direction.z != 0 else float('-inf')
+        tzmax = (self.max_corner.z - ray.origin.z) / ray.direction.z if ray.direction.z != 0 else float('inf')
 
         if tzmin > tzmax:
             tzmin, tzmax = tzmax, tzmin
 
-        if tmin > tzmax or tzmin > tmax:
+        if (tmin > tzmax) or (tzmin > tmax):
             return None
 
-        tmin = max(tmin, tzmin)
+        if tzmin > tmin:
+            tmin = tzmin
+        if tzmax < tmax:
+            tmax = tzmax
 
         if tmin < 0.001:
-            return None
-
-        point = ray_origin + ray_dir * tmin
-
-        epsilon = 0.0001
-        if abs(point.x - self.min_p.x) < epsilon:
-            normal = Vec3(-1, 0, 0)
-        elif abs(point.x - self.max_p.x) < epsilon:
-            normal = Vec3(1, 0, 0)
-        elif abs(point.y - self.min_p.y) < epsilon:
-            normal = Vec3(0, -1, 0)
-        elif abs(point.y - self.max_p.y) < epsilon:
-            normal = Vec3(0, 1, 0)
-        elif abs(point.z - self.min_p.z) < epsilon:
-            normal = Vec3(0, 0, -1)
+            if tmax < 0.001:
+                return None
+            t = tmax
         else:
-            normal = Vec3(0, 0, 1)
+            t = tmin
 
-        return (tmin, point, normal)
-
-class Plane:
-    def __init__(self, point, normal, material, wall_id=""):
-        self.point = point
-        self.normal = normal.normalize()
-        self.material = material
-        self.wall_id = wall_id
-
-    def intersect(self, ray_origin, ray_dir):
-        denom = self.normal.dot(ray_dir)
-        if abs(denom) < 0.0001:
-            return None
-
-        t = (self.point - ray_origin).dot(self.normal) / denom
         if t < 0.001:
             return None
 
-        point = ray_origin + ray_dir * t
-        return (t, point, self.normal)
-
-# ==================== RAY TRACER ====================
-
-class RayTracer:
-    def __init__(self, width, height):
-        self.width = width
-        self.height = height
-        self.camera_pos = Vec3(0, 0, -5)
-        self.light_pos = Vec3(0, 1.8, 0)
-        self.objects = []
-
-    def setup_scene(self, sphere_refl, cube_refl, sphere_trans, cube_trans, mirror_wall):
-        self.objects = []
-
-        # Стены
-        walls = [
-            Plane(Vec3(0, -2, 0), Vec3(0, 1, 0), Material((0.9, 0.9, 0.9)), "bottom"),
-            Plane(Vec3(0, 2, 0), Vec3(0, -1, 0), Material((0.9, 0.9, 0.9)), "top"),
-            Plane(Vec3(-2, 0, 0), Vec3(1, 0, 0), Material((0.9, 0.1, 0.1)), "left"),
-            Plane(Vec3(2, 0, 0), Vec3(-1, 0, 0), Material((0.1, 0.9, 0.1)), "right"),
-            Plane(Vec3(0, 0, 2), Vec3(0, 0, -1), Material((0.9, 0.9, 0.9)), "back"),
-        ]
-
-        for wall in walls:
-            if wall.wall_id == mirror_wall:
-                wall.material.reflective = True
-
-        self.objects.extend(walls)
-
-        # Шары
-        self.objects.append(Sphere(
-            Vec3(-0.7, -1.3, 0.5), 0.7,
-            Material((0.3, 0.3, 0.9), sphere_refl, sphere_trans)
-        ))
-        self.objects.append(Sphere(
-            Vec3(0.9, -1.2, -0.3), 0.8,
-            Material((0.9, 0.9, 0.1), sphere_refl, sphere_trans)
-        ))
-
-        # Кубы
-        self.objects.append(Box(
-            Vec3(-0.8, 0.2, -0.5), Vec3(0.8, 1.2, 0.8),
-            Material((0.9, 0.9, 0.9), cube_refl, cube_trans)
-        ))
-        self.objects.append(Box(
-            Vec3(0.7, 0.5, 0.7), Vec3(0.9, 1.5, 0.9),
-            Material((0.9, 0.9, 0.9), cube_refl, cube_trans)
-        ))
-
-    def trace(self, ray_origin, ray_dir, depth=0):
-        if depth > 2:
-            return (0.05, 0.05, 0.05)
-
-        closest = None
-        min_t = 1e10
-        closest_obj = None
-
-        for obj in self.objects:
-            hit = obj.intersect(ray_origin, ray_dir)
-            if hit and hit[0] < min_t:
-                min_t = hit[0]
-                closest = hit
-                closest_obj = obj
-
-        if not closest:
-            return (0.05, 0.05, 0.05)
-
-        t, point, normal = closest
-        mat = closest_obj.material
-
-        to_light = (self.light_pos - point).normalize()
-        diffuse = max(0, normal.dot(to_light))
-
-        shadow_ray_origin = point + normal * 0.001
-        in_shadow = False
-        for obj in self.objects:
-            if obj != closest_obj and obj.intersect(shadow_ray_origin, to_light):
-                in_shadow = True
-                break
-
-        ambient = 0.2
-        light_intensity = ambient if in_shadow else ambient + diffuse * 1.2
-        color = (mat.color[0] * light_intensity,
-                mat.color[1] * light_intensity,
-                mat.color[2] * light_intensity)
-
-        if mat.reflective and depth < 2:
-            reflect_dir = ray_dir.reflect(normal)
-            reflect_origin = point + normal * 0.001
-            reflect_color = self.trace(reflect_origin, reflect_dir, depth + 1)
-            color = (color[0] * 0.3 + reflect_color[0] * 0.7,
-                    color[1] * 0.3 + reflect_color[1] * 0.7,
-                    color[2] * 0.3 + reflect_color[2] * 0.7)
-
-        if mat.transparent and depth < 2:
-            refract_origin = point + ray_dir * 0.001
-            refract_color = self.trace(refract_origin, ray_dir, depth + 1)
-            color = (color[0] * 0.3 + refract_color[0] * 0.7,
-                    color[1] * 0.3 + refract_color[1] * 0.7,
-                    color[2] * 0.3 + refract_color[2] * 0.7)
-
-        return color
-
-# ==================== GUI ====================
-
-class CornellBoxApp:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("Корнуэльская комната")
-        self.root.geometry("850x650")
-        self.root.configure(bg="#1a1a2e")
-
-        self.width = 400  # Уменьшено для скорости
-        self.height = 400
-
-        self.sphere_refl = False
-        self.cube_refl = False
-        self.sphere_trans = False
-        self.cube_trans = False
-        self.mirror_wall = None
-
-        self.rendering = False
-        self.current_line = 0
-
-        self.create_widgets()
-        self.root.after(100, self.start_render)
-
-    def create_widgets(self):
-        main_frame = tk.Frame(self.root, bg="#1a1a2e")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        self.canvas = tk.Canvas(main_frame, width=400, height=400, bg="#0f0f1e",
-                               highlightthickness=2, highlightbackground="#444")
-        self.canvas.pack(side=tk.LEFT, padx=(0, 10))
-
-        control_frame = tk.Frame(main_frame, bg="#16213e", width=220)
-        control_frame.pack(side=tk.RIGHT, fill=tk.Y)
-        control_frame.pack_propagate(False)
-
-        tk.Label(control_frame, text="Корнуэльская комната",
-                bg="#16213e", fg="#e8e8e8",
-                font=("Arial", 12, "bold")).pack(pady=(20, 15))
-
-        tk.Label(control_frame, text="Отражение:",
-                bg="#16213e", fg="#a8a8a8",
-                font=("Arial", 10, "bold")).pack(pady=(10, 5))
-
-        self.sphere_refl_var = tk.BooleanVar()
-        tk.Checkbutton(control_frame, text="Шары",
-                      variable=self.sphere_refl_var,
-                      command=self.on_change,
-                      bg="#16213e", fg="#e8e8e8",
-                      selectcolor="#0f3460").pack()
-
-        self.cube_refl_var = tk.BooleanVar()
-        tk.Checkbutton(control_frame, text="Кубы",
-                      variable=self.cube_refl_var,
-                      command=self.on_change,
-                      bg="#16213e", fg="#e8e8e8",
-                      selectcolor="#0f3460").pack()
-
-        tk.Label(control_frame, text="Прозрачность:",
-                bg="#16213e", fg="#a8a8a8",
-                font=("Arial", 10, "bold")).pack(pady=(15, 5))
-
-        self.sphere_trans_var = tk.BooleanVar()
-        tk.Checkbutton(control_frame, text="Шары",
-                      variable=self.sphere_trans_var,
-                      command=self.on_change,
-                      bg="#16213e", fg="#e8e8e8",
-                      selectcolor="#0f3460").pack()
-
-        self.cube_trans_var = tk.BooleanVar()
-        tk.Checkbutton(control_frame, text="Кубы",
-                      variable=self.cube_trans_var,
-                      command=self.on_change,
-                      bg="#16213e", fg="#e8e8e8",
-                      selectcolor="#0f3460").pack()
-
-        tk.Label(control_frame, text="Зеркальная стена:",
-                bg="#16213e", fg="#a8a8a8",
-                font=("Arial", 10, "bold")).pack(pady=(15, 5))
-
-        self.mirror_var = tk.StringVar(value="none")
-        for text, value in [("Нет", "none"), ("Левая", "left"),
-                           ("Правая", "right"), ("Задняя", "back"),
-                           ("Пол", "bottom"), ("Потолок", "top")]:
-            tk.Radiobutton(control_frame, text=text, variable=self.mirror_var,
-                          value=value, command=self.on_change,
-                          bg="#16213e", fg="#e8e8e8",
-                          selectcolor="#0f3460").pack()
-
-        tk.Button(control_frame, text="Рендер (Space)",
-                 command=self.start_render,
-                 bg="#0f3460", fg="#e8e8e8",
-                 font=("Arial", 10, "bold")).pack(pady=20)
-
-        self.status = tk.Label(control_frame, text="Готов",
-                              bg="#16213e", fg="#4ecca3",
-                              font=("Arial", 9))
-        self.status.pack()
-
-        self.root.bind("<space>", lambda e: self.start_render())
-        self.root.bind("1", lambda e: self.toggle_var(self.sphere_refl_var))
-        self.root.bind("2", lambda e: self.toggle_var(self.cube_refl_var))
-        self.root.bind("3", lambda e: self.toggle_var(self.sphere_trans_var))
-        self.root.bind("4", lambda e: self.toggle_var(self.cube_trans_var))
-
-    def toggle_var(self, var):
-        var.set(not var.get())
-        self.on_change()
-
-    def on_change(self):
-        self.start_render()
-
-    def start_render(self):
-        if self.rendering:
-            return
-
-        self.rendering = True
-        self.current_line = 0
-        self.status.config(text="Рендеринг...", fg="#ffd700")
-
-        self.img = tk.PhotoImage(width=self.width, height=self.height)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self.img)
-
-        self.tracer = RayTracer(self.width, self.height)
-        self.tracer.setup_scene(
-            self.sphere_refl_var.get(),
-            self.cube_refl_var.get(),
-            self.sphere_trans_var.get(),
-            self.cube_trans_var.get(),
-            self.mirror_var.get() if self.mirror_var.get() != "none" else None
+        point = Vec3(
+            ray.origin.x + t * ray.direction.x,
+            ray.origin.y + t * ray.direction.y,
+            ray.origin.z + t * ray.direction.z
         )
 
-        self.render_lines()
+        normal = self.get_normal(point)
 
-    def render_lines(self):
-        if self.current_line >= self.height:
-            self.rendering = False
-            self.status.config(text="Готово!", fg="#4ecca3")
-            return
+        return HitRecord(point, normal, t, self.material)
 
-        # Рендер нескольких строк за раз
-        batch_size = 10
-        for _ in range(batch_size):
-            if self.current_line >= self.height:
-                break
+    def get_normal(self, point: Vec3) -> Vec3:
+        epsilon = 0.001
+        if abs(point.x - self.min_corner.x) < epsilon:
+            return Vec3(-1, 0, 0)
+        elif abs(point.x - self.max_corner.x) < epsilon:
+            return Vec3(1, 0, 0)
+        elif abs(point.y - self.min_corner.y) < epsilon:
+            return Vec3(0, -1, 0)
+        elif abs(point.y - self.max_corner.y) < epsilon:
+            return Vec3(0, 1, 0)
+        elif abs(point.z - self.min_corner.z) < epsilon:
+            return Vec3(0, 0, -1)
+        else:
+            return Vec3(0, 0, 1)
 
-            y = self.current_line
-            aspect = self.width / self.height
-            scale = math.tan(math.radians(30))
 
-            colors = []
-            for x in range(self.width):
-                px = (2 * (x + 0.5) / self.width - 1) * aspect * scale
-                py = (1 - 2 * (y + 0.5) / self.height) * scale
+class Plane:
+    """Плоскость (для стен комнаты)"""
 
-                ray_dir = Vec3(px, py, 1).normalize()
-                color = self.tracer.trace(self.tracer.camera_pos, ray_dir)
+    def __init__(self, point: Vec3, normal: Vec3, material: Material):
+        self.point = point
+        self.normal = normal.normalize()
+        self.material = material
 
-                r = min(255, int(color[0] * 255))
-                g = min(255, int(color[1] * 255))
-                b = min(255, int(color[2] * 255))
-                colors.append(f"#{r:02x}{g:02x}{b:02x}")
+    def intersect(self, ray: Ray) -> Optional[HitRecord]:
+        denom = self.normal.dot(ray.direction)
+        if abs(denom) > 0.0001:
+            t = (self.point - ray.origin).dot(self.normal) / denom
+            if t > 0.001:
+                point = Vec3(
+                    ray.origin.x + t * ray.direction.x,
+                    ray.origin.y + t * ray.direction.y,
+                    ray.origin.z + t * ray.direction.z
+                )
+                return HitRecord(point, self.normal, t, self.material)
+        return None
 
-            self.img.put(" ".join(colors), to=(0, y))
-            self.current_line += 1
 
-        progress = int((self.current_line / self.height) * 100)
-        self.status.config(text=f"Рендеринг: {progress}%")
+class PointLight:
+    """Точечный источник света"""
 
-        self.root.after(1, self.render_lines)
+    def __init__(self, position: Vec3, color: Vec3, intensity: float = 1.0):
+        self.position = position
+        self.color = color
+        self.intensity = intensity
 
-    def run(self):
-        self.root.mainloop()
+
+class Scene:
+    """Сцена"""
+
+    def __init__(self):
+        self.objects = []
+        self.lights = []
+        self.transparent_mode = False
+
+    def add_object(self, obj):
+        self.objects.append(obj)
+
+    def add_light(self, light: PointLight):
+        self.lights.append(light)
+
+    def set_transparency(self, transparent: bool):
+        """Установить прозрачность для всех объектов, которые могут быть прозрачными"""
+        self.transparent_mode = transparent
+        for obj in self.objects:
+            if hasattr(obj, 'set_transparency'):
+                obj.set_transparency(transparent)
+
+    def intersect(self, ray: Ray) -> Optional[HitRecord]:
+        """Пересечение луча со сценой"""
+        closest_hit = None
+        closest_t = float('inf')
+
+        for obj in self.objects:
+            hit = obj.intersect(ray)
+            if hit and hit.t < closest_t:
+                closest_hit = hit
+                closest_t = hit.t
+
+        return closest_hit
+
+
+def create_cornell_box() -> Scene:
+    """Создание Корнуэльской комнаты"""
+    scene = Scene()
+
+    # Размер комнаты
+    room_size = 5.0
+
+    # Пол (белый)
+    floor_material = Material(
+        Vec3(0.73, 0.73, 0.73),
+        ambient=0.3,
+        diffuse=0.9,
+        specular=0.1
+    )
+    scene.add_object(Plane(Vec3(0, -room_size / 2, 0), Vec3(0, 1, 0), floor_material))
+
+    # Потолок (белый)
+    ceiling_material = Material(
+        Vec3(0.73, 0.73, 0.73),
+        ambient=0.3,
+        diffuse=0.9,
+        specular=0.1
+    )
+    scene.add_object(Plane(Vec3(0, room_size / 2, 0), Vec3(0, -1, 0), ceiling_material))
+
+    # Задняя стена (белая)
+    back_wall_material = Material(
+        Vec3(0.73, 0.73, 0.73),
+        ambient=0.3,
+        diffuse=0.9,
+        specular=0.1
+    )
+    scene.add_object(Plane(Vec3(0, 0, -room_size / 2), Vec3(0, 0, 1), back_wall_material))
+
+    # Левая стена (красная)
+    left_wall_material = Material(
+        Vec3(0.65, 0.05, 0.05),
+        ambient=0.3,
+        diffuse=0.9,
+        specular=0.1
+    )
+    scene.add_object(Plane(Vec3(-room_size / 2, 0, 0), Vec3(1, 0, 0), left_wall_material))
+
+    # Правая стена (синяя)
+    blue_wall_material = Material(
+        Vec3(0.05, 0.05, 0.65),
+        ambient=0.3,
+        diffuse=0.9,
+        specular=0.1
+    )
+    scene.add_object(Plane(Vec3(room_size / 2, 0, 0), Vec3(-1, 0, 0), blue_wall_material))
+
+    # Желтая сфера
+    yellow_material = Material(
+        Vec3(0.8, 0.8, 0.1),
+        ambient=0.2,
+        diffuse=0.8,
+        specular=0.3,
+        shininess=64.0
+    )
+    yellow_sphere = Sphere(Vec3(-1.2, -1.5, -0.5), 0.7, yellow_material)
+    scene.add_object(yellow_sphere)
+
+    # Бежевая сфера
+    beige_material = Material(
+        Vec3(0.6, 0.5, 0.4),
+        ambient=0.2,
+        diffuse=0.8,
+        specular=0.2,
+        shininess=32.0
+    )
+    beige_sphere = Sphere(Vec3(1.0, -0.5, 0.5), 1.0, beige_material)
+    scene.add_object(beige_sphere)
+
+    # Куб
+    purple_material = Material(
+        Vec3(0.5, 0.1, 0.7),
+        ambient=0.2,
+        diffuse=0.7,
+        specular=0.4,
+        shininess=128.0
+    )
+    cube = Cube(Vec3(0, -2.0, 3.0), 1.0, purple_material)
+    scene.add_object(cube)
+
+    # источник света
+    light_material = Material(
+        Vec3(1, 1, 1),
+        ambient=0.0,
+        diffuse=0.0,
+        specular=0.0,
+        emissive=Vec3(8.0, 8.0, 8.0)
+    )
+    scene.add_object(Sphere(Vec3(0, 2.3, 0), 0.4, light_material))
+
+    # Точечный источник света
+    scene.add_light(PointLight(Vec3(0, 2.3, 0), Vec3(1, 1, 1), 30.0))
+
+    # Дополнительный свет
+    scene.add_light(PointLight(Vec3(0, 1.5, 0), Vec3(1, 1, 1), 15.0))
+
+    return scene
+
+
+def shade_simple_transparency(hit: HitRecord, scene: Scene, ray: Ray) -> Vec3:
+    """Простая версия затенения с прозрачностью"""
+    # Если объект светится сам
+    if hit.material.emissive.x > 0 or hit.material.emissive.y > 0 or hit.material.emissive.z > 0:
+        return hit.material.emissive
+
+    color = Vec3(0, 0, 0)
+
+    # Ambient (окружающее освещение)
+    ambient = hit.material.color * hit.material.ambient
+    color = color + ambient
+
+    for light in scene.lights:
+        # Направление к источнику света
+        light_dir = (light.position - hit.point).normalize()
+        light_distance = (light.position - hit.point).length()
+
+        # Аттенюация по расстоянию
+        attenuation = 1.0 / (light_distance * light_distance + 1.0)
+
+        # Проверка на тень
+        shadow_ray = Ray(hit.point + hit.normal * 0.001, light_dir)
+        shadow_hit = scene.intersect(shadow_ray)
+
+        # Для прозрачных объектов делаем тени слабее
+        shadow_factor = 1.0
+        if shadow_hit and shadow_hit.t < light_distance - 0.001:
+            if shadow_hit.material.transparency > 0:
+                shadow_factor = 1.0 - shadow_hit.material.transparency * 0.3
+            else:
+                continue
+
+        # Diffuse (диффузное отражение)
+        diffuse_intensity = max(0, hit.normal.dot(light_dir))
+        if diffuse_intensity > 0:
+            diffuse_color = Vec3(
+                hit.material.color.x * light.color.x,
+                hit.material.color.y * light.color.y,
+                hit.material.color.z * light.color.z
+            )
+            diffuse = diffuse_color * hit.material.diffuse * diffuse_intensity * light.intensity * attenuation * shadow_factor
+            color = color + diffuse
+
+        # Specular (зеркальное отражение)
+        view_dir = (ray.origin - hit.point).normalize()
+        half_dir = (light_dir + view_dir).normalize()
+        spec_intensity = max(0, hit.normal.dot(half_dir)) ** hit.material.shininess
+        if spec_intensity > 0:
+            specular = light.color * hit.material.specular * spec_intensity * light.intensity * attenuation * shadow_factor
+            color = color + specular
+
+    # Для прозрачных объектов добавляем цвет фона, чтобы было видно сквозь них
+    if hit.material.transparency > 0:
+        # Продолжаем луч чтобы найти фон
+        background_ray = Ray(hit.point + ray.direction * 0.001, ray.direction)
+        background_hit = scene.intersect(background_ray)
+
+        if background_hit:
+            background_color = shade_simple_transparency(background_hit, scene, background_ray)
+            # Смешиваем цвет объекта с цветом фона
+            transparency = hit.material.transparency
+            color = Vec3(
+                color.x * (1 - transparency) + background_color.x * transparency,
+                color.y * (1 - transparency) + background_color.y * transparency,
+                color.z * (1 - transparency) + background_color.z * transparency
+            )
+        else:
+            # Если нет фона, просто делаем объект полупрозрачным
+            transparency = hit.material.transparency
+            color = color * (1 - transparency * 0.5)
+
+    # Гамма-коррекция
+    gamma = 2.2
+    color = Vec3(
+        min(1.0, color.x ** (1.0 / gamma)),
+        min(1.0, color.y ** (1.0 / gamma)),
+        min(1.0, color.z ** (1.0 / gamma))
+    )
+
+    return color
+
+
+def render(scene: Scene, width: int = 800, height: int = 600, anti_aliasing: bool = True) -> np.ndarray:
+    """Рендеринг сцены с антиалиасингом"""
+    image = np.zeros((height, width, 3))
+
+    camera_pos = Vec3(0, 0, 10.0)
+    aspect_ratio = width / height
+    fov = 45
+    scale = math.tan(math.radians(fov * 0.5))
+
+    samples_per_pixel = 4 if anti_aliasing else 1
+
+    for y in range(height):
+        if y % 50 == 0:
+            print(f"Рендеринг: {y}/{height}")
+
+        for x in range(width):
+            pixel_color = Vec3(0, 0, 0)
+
+            for sample in range(samples_per_pixel):
+                # Добавляем случайное смещение для антиалиасинга
+                if anti_aliasing and samples_per_pixel > 1:
+                    offset_x = (np.random.random() - 0.5) * 0.5
+                    offset_y = (np.random.random() - 0.5) * 0.5
+                else:
+                    offset_x = offset_y = 0
+
+                # Вычисление направления луча
+                px = (2 * (x + 0.5 + offset_x) / width - 1) * aspect_ratio * scale
+                py = (1 - 2 * (y + 0.5 + offset_y) / height) * scale
+
+                ray_dir = Vec3(px, py, -1).normalize()
+                ray = Ray(camera_pos, ray_dir)
+
+                # Трассировка луча
+                hit = scene.intersect(ray)
+
+                if hit:
+                    color = shade_simple_transparency(hit, scene, ray)
+                    pixel_color = pixel_color + color
+
+            # Усредняем по сэмплам
+            if samples_per_pixel > 1:
+                pixel_color = pixel_color / samples_per_pixel
+
+            image[y, x] = [pixel_color.x, pixel_color.y, pixel_color.z]
+
+    return image
+
+
+class InteractiveRenderer:
+    """Интерактивный рендерер с кнопкой"""
+
+    def __init__(self):
+        self.scene = create_cornell_box()
+        self.transparent_mode = False
+        self.render_width = 800
+        self.render_height = 600
+
+        # Создаем фигуру с кнопкой
+        self.fig, self.ax = plt.subplots(figsize=(12, 9))
+        plt.subplots_adjust(bottom=0.15)
+
+        # Создаем кнопку
+        self.button_ax = plt.axes([0.4, 0.05, 0.2, 0.075])
+        self.button = Button(self.button_ax, 'Включить прозрачность',
+                             color='lightgoldenrodyellow', hovercolor='0.975')
+
+        # Назначаем обработчик нажатия
+        self.button.on_clicked(self.toggle_transparency)
+
+        # Первоначальный рендеринг
+        self.render_and_display()
+
+    def toggle_transparency(self, event):
+        """Переключение режима прозрачности"""
+        self.transparent_mode = not self.transparent_mode
+
+        # Обновляем сцену
+        self.scene.set_transparency(self.transparent_mode)
+
+        # Обновляем текст кнопки
+        if self.transparent_mode:
+            self.button.label.set_text('Выключить прозрачность')
+        else:
+            self.button.label.set_text('Включить прозрачность')
+
+        # Перерисовываем изображение
+        self.render_and_display()
+
+    def render_and_display(self):
+        """Рендеринг и отображение сцены"""
+        print(f"Рендеринг (прозрачность: {'ВКЛ' if self.transparent_mode else 'ВЫКЛ'})...")
+
+        # Рендерим сцену с высоким качеством и антиалиасингом
+        image = render(self.scene,
+                       width=self.render_width,
+                       height=self.render_height,
+                       anti_aliasing=True)
+
+        # Очищаем и отображаем новое изображение
+        self.ax.clear()
+        self.ax.imshow(image, interpolation='bicubic')  # Качественная интерполяция
+        self.ax.axis('off')
+
+        title = 'Корнуэльская комната с кубом'
+        if self.transparent_mode:
+            title += ' (прозрачность ВКЛ)'
+        self.ax.set_title(title, fontsize=16, pad=20)
+
+        # Обновляем отображение
+        self.fig.canvas.draw_idle()
+        print("Готово!")
+
+
+def main():
+    """Главная функция"""
+    # Создаем интерактивный рендерер
+    renderer = InteractiveRenderer()
+
+    plt.show()
+
 
 if __name__ == "__main__":
-    app = CornellBoxApp()
-    app.run()
+    main()
